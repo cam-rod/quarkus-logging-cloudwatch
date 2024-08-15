@@ -23,16 +23,20 @@ import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.jboss.logging.Logger;
 
 import io.quarkiverse.logging.cloudwatch.format.ElasticCommonSchemaLogFormatter;
 import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
 import software.amazon.awssdk.services.cloudwatchlogs.model.InputLogEvent;
+import software.amazon.awssdk.services.cloudwatchlogs.model.InvalidParameterException;
 import software.amazon.awssdk.services.cloudwatchlogs.model.InvalidSequenceTokenException;
 import software.amazon.awssdk.services.cloudwatchlogs.model.PutLogEventsRequest;
 
 class LoggingCloudWatchHandler extends Handler {
+    static final Pattern UPLOAD_TOO_LARGE_PATTERN = Pattern.compile("Upload too large: (?<actual>[0-9]*) bytes exceeds limit of (?<expected>[0-9])");
 
     private static final Logger LOGGER = Logger.getLogger(LoggingCloudWatchHandler.class);
     private static final int BATCH_MAX_ATTEMPTS = 10;
@@ -138,42 +142,80 @@ class LoggingCloudWatchHandler extends Handler {
                 List<InputLogEvent> events = new ArrayList<>(Math.min(eventBuffer.size(), batchSize));
                 eventBuffer.drainTo(events, batchSize);
                 if (events.size() > 0) {
-
+                    // One request is sent at a time, unless a large upload needs to be split. A boolean is set
                     // The sequence token needed for this request is set below.
-                    PutLogEventsRequest request = PutLogEventsRequest.builder()
-                            .logGroupName(logGroupName)
-                            .logStreamName(logStreamName)
-                            .logEvents(events)
-                            .build();
+                    List<PutLogEventsRequest> requests = new ArrayList<>(List.of(
+                            buildRequest(events))
+                    );
+
+                    int lastAcceptedRequest = -1;
 
                     /*
                      * The current sequence token may not be valid if it was used by another application or pod.
                      * If that happens, we'll retry using the token from the InvalidSequenceTokenException.
                      */
                     for (int i = 1; i <= BATCH_MAX_ATTEMPTS; i++) {
+                        // Remove previously accepted requests
+                        for (int accepted = 0; accepted <= lastAcceptedRequest; accepted++) {
+                            requests.removeFirst();
+                        }
+                        lastAcceptedRequest = -1;
 
-                        request = request.toBuilder()
-                                .sequenceToken(sequenceToken)
-                                .build();
+                        for (int reqIdx = 0; reqIdx < requests.size(); reqIdx++) {
+                            PutLogEventsRequest request = requests.get(reqIdx).toBuilder()
+                                    .sequenceToken(sequenceToken)
+                                    .build();
 
-                        try {
-                            /*
-                             * It's time to put the log events into CloudWatch.
-                             * If that works, we'll use the sequence token from the response for the next put call.
-                             */
-                            sequenceToken = cloudWatchLogsClient.putLogEvents(request).nextSequenceToken();
-                            // The sequence token was accepted, we don't need to retry.
-                            break;
-                        } catch (InvalidSequenceTokenException e) {
-                            LOGGER.debugf("PutLogEvents call failed because of an invalid sequence token", e);
+                            try {
+                                /*
+                                 * It's time to put the log events into CloudWatch.
+                                 * If that works, we'll use the sequence token from the response for the next put call.
+                                 */
+                                sequenceToken = cloudWatchLogsClient.putLogEvents(request).nextSequenceToken();
+                                // The sequence token was accepted, we don't need to retry.
+                                lastAcceptedRequest++;
+                            } catch (InvalidSequenceTokenException e) {
+                                LOGGER.debugf("PutLogEvents call failed because of an invalid sequence token", e);
 
-                            // We'll use the sequence token from the exception for the next put call.
-                            sequenceToken = e.expectedSequenceToken();
+                                // We'll use the sequence token from the exception for the next put call.
+                                sequenceToken = e.expectedSequenceToken();
 
-                            // If the last attempt failed, the log events from the current batch are lost.
-                            if (i == BATCH_MAX_ATTEMPTS) {
-                                LOGGER.warn(
-                                        "Too many retries for a PutLogEvents call, log events from the current batch will not be sent to CloudWatch");
+                                // If the last attempt failed, the log events from the current batch are lost.
+                                if (i == BATCH_MAX_ATTEMPTS) {
+                                    LOGGER.warn(
+                                            "Too many retries for a PutLogEvents call, log events from the current batch will not be sent to CloudWatch");
+                                    break;
+                                }
+
+                                // Requeue request and restart
+                                requests.addFirst(request);
+                                break;
+                            } catch (InvalidParameterException e) {
+                                Matcher matches = UPLOAD_TOO_LARGE_PATTERN.matcher(e.getMessage());
+
+                                if (e.statusCode() == 400 && matches.hasMatch()) {
+                                    int actualSize = Integer.parseInt(matches.group("actual"));
+                                    int expectedSize = Integer.parseInt(matches.group("expected"));
+
+                                    LOGGER.warn("Submitted log events have size %d bytes exceeding limit of %d, attempting to split into multiple requests");
+
+                                    int numRequests = (int) Math.ceil((double) actualSize / (double) expectedSize);
+                                    List<InputLogEvent> requestEvents = request.logEvents();
+                                    int numEvents = requestEvents.size();
+
+                                    for (int subRequest = 0; subRequest < numRequests; subRequest++) {
+                                        // Add each sub-request after the original request. Since these are separate batches, the order does not matter.
+                                        List<InputLogEvent> subRequestEvents = requestEvents.subList(
+                                                subRequest * (numEvents/numRequests),
+                                                Math.max((subRequest + 1) * (numEvents/numRequests), numEvents));
+
+                                        requests.add(reqIdx+1, buildRequest(subRequestEvents));
+                                    }
+
+                                    // Mark the oversized request as "accepted" so that it will be removed
+                                    lastAcceptedRequest++;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -181,6 +223,14 @@ class LoggingCloudWatchHandler extends Handler {
             } catch (Throwable t) {
                 LOGGER.error("PutLogEvents call failed, log events from the current batch will not be sent to CloudWatch", t);
             }
+        }
+
+        private PutLogEventsRequest buildRequest(List<InputLogEvent> events) {
+            return PutLogEventsRequest.builder()
+                    .logGroupName(logGroupName)
+                    .logStreamName(logStreamName)
+                    .logEvents(events)
+                    .build();
         }
     }
 
