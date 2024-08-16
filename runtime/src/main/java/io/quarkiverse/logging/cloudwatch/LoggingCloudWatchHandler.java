@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Stack;
 import java.util.concurrent.*;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
@@ -36,7 +37,7 @@ import software.amazon.awssdk.services.cloudwatchlogs.model.InvalidSequenceToken
 import software.amazon.awssdk.services.cloudwatchlogs.model.PutLogEventsRequest;
 
 class LoggingCloudWatchHandler extends Handler {
-    static final Pattern UPLOAD_TOO_LARGE_PATTERN = Pattern.compile("Upload too large: (?<actual>[0-9]*) bytes exceeds limit of (?<expected>[0-9])");
+    static final Pattern UPLOAD_TOO_LARGE_PATTERN = Pattern.compile("Upload too large: (?<actual>[0-9]+) bytes exceeds limit of (?<expected>[0-9]+)");
 
     private static final Logger LOGGER = Logger.getLogger(LoggingCloudWatchHandler.class);
     private static final int BATCH_MAX_ATTEMPTS = 10;
@@ -144,25 +145,16 @@ class LoggingCloudWatchHandler extends Handler {
                 if (events.size() > 0) {
                     // One request is sent at a time, unless a large upload needs to be split. A boolean is set
                     // The sequence token needed for this request is set below.
-                    List<PutLogEventsRequest> requests = new ArrayList<>(List.of(
-                            buildRequest(events))
-                    );
-
-                    int lastAcceptedRequest = -1;
+                    Stack<PutLogEventsRequest> requestStack = new Stack<>();
+                    requestStack.push(buildRequest(events));
 
                     /*
                      * The current sequence token may not be valid if it was used by another application or pod.
                      * If that happens, we'll retry using the token from the InvalidSequenceTokenException.
                      */
                     for (int i = 1; i <= BATCH_MAX_ATTEMPTS; i++) {
-                        // Remove previously accepted requests
-                        for (int accepted = 0; accepted <= lastAcceptedRequest; accepted++) {
-                            requests.removeFirst();
-                        }
-                        lastAcceptedRequest = -1;
-
-                        for (int reqIdx = 0; reqIdx < requests.size(); reqIdx++) {
-                            PutLogEventsRequest request = requests.get(reqIdx).toBuilder()
+                        while (!requestStack.empty()) {
+                            PutLogEventsRequest request = requestStack.pop().toBuilder()
                                     .sequenceToken(sequenceToken)
                                     .build();
 
@@ -173,7 +165,6 @@ class LoggingCloudWatchHandler extends Handler {
                                  */
                                 sequenceToken = cloudWatchLogsClient.putLogEvents(request).nextSequenceToken();
                                 // The sequence token was accepted, we don't need to retry.
-                                lastAcceptedRequest++;
                             } catch (InvalidSequenceTokenException e) {
                                 LOGGER.debugf("PutLogEvents call failed because of an invalid sequence token", e);
 
@@ -188,7 +179,7 @@ class LoggingCloudWatchHandler extends Handler {
                                 }
 
                                 // Requeue request and restart
-                                requests.addFirst(request);
+                                requestStack.push(request);
                                 break;
                             } catch (InvalidParameterException e) {
                                 Matcher matches = UPLOAD_TOO_LARGE_PATTERN.matcher(e.getMessage());
@@ -204,16 +195,14 @@ class LoggingCloudWatchHandler extends Handler {
                                     int numEvents = requestEvents.size();
 
                                     for (int subRequest = 0; subRequest < numRequests; subRequest++) {
-                                        // Add each sub-request after the original request. Since these are separate batches, the order does not matter.
+                                        // Add each sub-request. Since these are separate batches, the order does not matter.
                                         List<InputLogEvent> subRequestEvents = requestEvents.subList(
                                                 subRequest * (numEvents/numRequests),
                                                 Math.max((subRequest + 1) * (numEvents/numRequests), numEvents));
 
-                                        requests.add(reqIdx+1, buildRequest(subRequestEvents));
+                                        requestStack.push(buildRequest(subRequestEvents));
                                     }
 
-                                    // Mark the oversized request as "accepted" so that it will be removed
-                                    lastAcceptedRequest++;
                                     break;
                                 }
                             }
